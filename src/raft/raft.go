@@ -59,6 +59,7 @@ const (
 
 const (
 	HeartbeatInterval = 100
+	HeartbeatTimeout  = 2000
 )
 
 // A Go object implementing a single Raft peer.
@@ -239,8 +240,8 @@ func (rf *Raft) PrintStatus() {
 
 func (rf *Raft) Vote() (success bool) {
 	// fmt.Printf("id %v: Trying to vote for term(%v)\n", rf.me, rf.currentTerm)
-	count := 1
-	majority := len(rf.peers)/2 + 1
+	count := int32(1)
+	majority := int32(len(rf.peers)/2 + 1)
 	rf.votedFor = rf.me
 	stopCh := make(chan struct{})
 	chans := make(chan struct{}, len(rf.peers))
@@ -290,7 +291,7 @@ func (rf *Raft) Vote() (success bool) {
 			// fmt.Println("Vote reached timeout!")
 			return false
 		case <-chans:
-			count++
+			atomic.AddInt32(&count, 1)
 			if failed {
 				return false
 			}
@@ -331,6 +332,54 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 func (rf *Raft) sendRequestAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
 	return ok
+}
+
+// Broadcast heartbeat
+func (rf *Raft) BroadcastHeartbeat() bool {
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+
+	var wg sync.WaitGroup
+	sendHeartbeat := func(target int) {
+		req := &AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		resp := &AppendEntriesReply{}
+		if rf.state == StateLeader {
+			ok := rf.sendRequestAppendEntries(target, req, resp)
+			if ok && rf.updateTerm(resp.Term) {
+				stopCh <- struct{}{}
+			}
+		} else {
+			stopCh <- struct{}{}
+		}
+		wg.Done()
+	}
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go sendHeartbeat(i)
+	}
+
+	go func() {
+		wg.Wait()
+		doneCh <- struct{}{}
+	}()
+
+	for {
+		select {
+		case <-stopCh:
+			return false
+		case <-doneCh:
+			return true
+		case <-time.After(HeartbeatTimeout * time.Millisecond):
+			return true
+		}
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -413,21 +462,7 @@ func (rf *Raft) ticker() {
 			}
 
 		case StateLeader:
-			for i := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-				req := &AppendEntriesArgs{
-					Term:     rf.currentTerm,
-					LeaderId: rf.me,
-				}
-				resp := &AppendEntriesReply{}
-				if rf.state == StateLeader {
-					rf.sendRequestAppendEntries(i, req, resp)
-				} else {
-					break
-				}
-			}
+			rf.BroadcastHeartbeat()
 			rf.sleepHeartbeatTimeout()
 
 		default:
